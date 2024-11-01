@@ -3,6 +3,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
+#include <unistd.h>
 
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
 #define MAX_WC 20 // Maximum work completion
@@ -32,6 +33,13 @@ struct rdma_context {
     uint32_t rkey; 
     uint64_t raddr;
 };
+
+void print_usage(const char *prog_name) {
+    printf("Usage: %s -m <msg_size> -n <num_concurr_msgs> -o <op>\n", prog_name);
+    printf("  -m  Message size (in bytes)\n");
+    printf("  -n  Number of concurrent messages\n");
+    printf("  -o  Operation type\n");
+}
 
 void die(const char *reason) {
     fprintf(stderr, "%s\n", reason);
@@ -314,10 +322,22 @@ int main (int argc, char *argv[]) {
     config->num_concurr_msgs = 1;
     config->op = SENDRECV;
 
-    if (argc == 4) {
-        config->msg_size = atoi(argv[1]); 
-        config->num_concurr_msgs = atoi(argv[2]);
-        config->op = atoi(argv[3]);
+    int opt;
+    while ((opt = getopt(argc, argv, "m:n:o:")) != -1) {
+        switch (opt) {
+            case 'm':
+                config->msg_size = atoi(optarg);
+                break;
+            case 'n':
+                config->num_concurr_msgs = atoi(optarg);
+                break;
+            case 'o':
+                config->op = atoi(optarg);
+                break;
+            default:  // '?'
+                print_usage(argv[0]);
+                exit(EXIT_FAILURE);
+        }
     }
     printf("msg_size = %d, num_concurr_msgs = %d, op = %s\n",
            config->msg_size,
