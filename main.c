@@ -1,13 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include <infiniband/verbs.h>
 
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
 
+typedef enum {
+    SENDRECV,
+    WRITE,
+} rdma_op_t;
+
 struct config_t {
     int msg_size;
     int num_concurr_msgs;
+    rdma_op_t op;
 };
 
 struct rdma_context {
@@ -20,6 +27,9 @@ struct rdma_context {
     struct ibv_device_attr dev_attr;
     char *buffer;
     size_t buffer_size;
+    // for remote access
+    uint32_t rkey; 
+    uint64_t raddr;
 };
 
 void die(const char *reason) {
@@ -229,13 +239,46 @@ void post_send(struct config_t *config, struct rdma_context *ctx, const char *ms
         };
         struct ibv_send_wr *bad_send_wr;
         if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
-            perror("ibv_post_send");
             die("Failed to post send request");
         }
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
 	    buf_ptr    = ctx->buffer + buf_offset;
     }
     printf("Successfully posted send request\n");
+}
+
+void post_write_signaled (struct config_t *config, struct rdma_context *ctx, const char *msg) {
+    strncpy(ctx->buffer, msg, ctx->buffer_size);
+    printf("Posting write signaled request\n");
+    int buf_offset = 0;
+    char *buff_ptr = ctx->buffer;
+    uint64_t raddr = ctx->raddr;
+    for (int i = 0; i < config->num_concurr_msgs; i++) {
+        struct ibv_sge sge = {
+            .addr   = (uintptr_t)buff_ptr,
+            .length = config->msg_size,
+            .lkey   = ctx->mr->lkey,
+        };
+        struct ibv_send_wr send_wr = {
+            .wr_id = (uint64_t)i,
+            .sg_list = &sge,
+            .num_sge = 1,
+            .opcode     = IBV_WR_RDMA_WRITE,
+            // .opcode     = IBV_WR_RDMA_WRITE_WITH_IMM,
+            .send_flags = IBV_SEND_SIGNALED,
+	        .wr.rdma.remote_addr = raddr,
+            .wr.rdma.rkey        = ctx->rkey,
+            // .imm_data = htonl(1),
+        };
+        struct ibv_send_wr *bad_send_wr;
+        if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+            die("Failed to post write signaled request");
+        }
+	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	    buff_ptr   = ctx->buffer + buf_offset;
+	    raddr      = ctx->raddr + buf_offset;
+    }
+    printf("Successfully posted write signaled request\n");
 }
 
 void poll_completion(struct rdma_context *ctx) {
@@ -248,6 +291,12 @@ void poll_completion(struct rdma_context *ctx) {
     if (num_completions < 0 || wc.status != IBV_WC_SUCCESS) {
         die("Failed to complete operation");
     }
+
+    // if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc.imm_data == htonl(1)) {
+    //     printf("RDMA write with immediate data completed on receiver\n");
+    // }
+
+    printf("Poll Completion");
 }
 
 void cleanup_rdma_context(struct rdma_context *ctx) {
@@ -264,12 +313,17 @@ int main (int argc, char *argv[]) {
     struct config_t *config = malloc(sizeof(struct config_t));
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
+    config->op = SENDRECV;
 
-    if (argc == 3) {
+    if (argc == 4) {
         config->msg_size = atoi(argv[1]); 
         config->num_concurr_msgs = atoi(argv[2]);
+        config->op = atoi(argv[3]);
     }
-    printf("msg_size = %d, num_concurr_msgs = %d\n", config->msg_size, config->num_concurr_msgs);
+    printf("msg_size = %d, num_concurr_msgs = %d, op = %s\n",
+           config->msg_size,
+           config->num_concurr_msgs,
+           config->op == SENDRECV ? "SENDRECV" : "WRITE");
     
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
     if (!dev_list) {
@@ -284,6 +338,10 @@ int main (int argc, char *argv[]) {
     struct rdma_context *ctx_sender   = init_rdma_context(config, dev_list[2]);
     struct rdma_context *ctx_receiver = init_rdma_context(config, dev_list[8]);
 
+    // Store receiver's rkey and raddr in sender's context
+    ctx_sender->rkey = ctx_receiver->mr->rkey;
+    ctx_sender->raddr = (uintptr_t)ctx_receiver->mr->addr;
+
     // Extract QP number and LID
     uint32_t qpn_sender = ctx_sender->qp->qp_num;
     uint32_t qpn_receiver = ctx_receiver->qp->qp_num;
@@ -296,19 +354,31 @@ int main (int argc, char *argv[]) {
     modify_qp_to_rts(ctx_sender->qp);
     modify_qp_to_rts(ctx_receiver->qp);
 
-    // Perform RDMA operations here
-    // Receiver should post receive first
-    post_receive(config, ctx_receiver);
-
-    // Sender should post send next
     const char *msg = "Hello, RDMA!";
-    post_send(config, ctx_sender, msg);
+    if (config->op == SENDRECV) {
+        // Perform RDMA SEND/RECV operations
+        // Receiver should post receive first
+        post_receive(config, ctx_receiver);
 
-    // Poll for completion
-    poll_completion(ctx_sender);
-    poll_completion(ctx_receiver);
-    // Display received message
-    printf("Received message: %s\n", ctx_receiver->buffer);
+        // Sender should post send next
+        post_send(config, ctx_sender, msg);
+
+        // Poll for completion
+        poll_completion(ctx_sender);
+        poll_completion(ctx_receiver);
+        // Display received message
+        printf("Received message: %s\n", ctx_receiver->buffer);
+    } else {
+        // Perform RDMA WRITE operation
+        // Sender should post write
+        post_write_signaled(config, ctx_sender, msg);
+
+        // Poll for completion
+        // poll_completion(ctx_receiver);
+        poll_completion(ctx_sender);
+        // Display received message
+        printf("Received message: %s\n", ctx_receiver->buffer);
+    }
 
     cleanup_rdma_context(ctx_sender);
     cleanup_rdma_context(ctx_receiver);
