@@ -3,8 +3,12 @@
 #include <string.h>
 #include <infiniband/verbs.h>
 
-#define MSG_SIZE 4096
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
+
+struct config_t {
+    int msg_size;
+    int num_concurr_msgs;
+};
 
 struct rdma_context {
     struct ibv_context *context;
@@ -27,7 +31,7 @@ void success(const char *reason) {
     fprintf(stdout, "%s\n", reason);
 }
 
-struct rdma_context *init_rdma_context(struct ibv_device *device) {
+struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_device *device) {
     int ret = 0;
     struct rdma_context *ctx = malloc(sizeof(struct rdma_context));
     if (!ctx) {
@@ -53,15 +57,16 @@ struct rdma_context *init_rdma_context(struct ibv_device *device) {
         success("Successfully allocated protection domain");
     }
 
-    ctx->buffer = malloc(MSG_SIZE);
-    ctx->buffer_size = MSG_SIZE;
+    ctx->buffer_size = config->msg_size * config->num_concurr_msgs;
+    ctx->buffer = malloc(ctx->buffer_size);
     if (!ctx->buffer) {
         die("Failed to allocate buffer");
     } else {
         success("Successfully allocated buffer");
     }
+    printf("  Buffer Size: %lu\n", ctx->buffer_size);
 
-    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buffer, MSG_SIZE, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buffer, ctx->buffer_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!ctx->mr) {
         die("Failed to register memory region");
     } else {
@@ -93,8 +98,8 @@ struct rdma_context *init_rdma_context(struct ibv_device *device) {
         .send_cq = ctx->cq,
         .recv_cq = ctx->cq,
         .cap = {
-            .max_send_wr = 1,
-            .max_recv_wr = 1,
+            .max_send_wr = config->num_concurr_msgs,
+            .max_recv_wr = config->num_concurr_msgs,
             .max_send_sge = 1,
             .max_recv_sge = 1
         },
@@ -179,48 +184,56 @@ void modify_qp_to_rts(struct ibv_qp *qp) {
     }
 }
 
-void post_receive(struct rdma_context *ctx) {
-    struct ibv_sge sge = {
-        .addr = (uintptr_t)ctx->buffer,
-        .length = ctx->buffer_size,
-        .lkey = ctx->mr->lkey,
-    };
-
-    struct ibv_recv_wr recv_wr = {
-        .wr_id = 0,
-        .sg_list = &sge,
-        .num_sge = 1,
-    };
-    struct ibv_recv_wr *bad_recv_wr;
-
+void post_receive(struct config_t *config, struct rdma_context *ctx) {
     printf("Posting receive request\n");
-    if (ibv_post_recv(ctx->qp, &recv_wr, &bad_recv_wr)) {
-        die("Failed to post receive request");
+    int buf_offset = 0;
+    char *buf_ptr  = ctx->buffer;
+    for (int i = 0; i < config->num_concurr_msgs; i++) {
+        struct ibv_sge sge = {
+            .addr = (uintptr_t)buf_ptr,
+            .length = config->msg_size,
+            .lkey = ctx->mr->lkey,
+        };
+        struct ibv_recv_wr recv_wr = {
+            .wr_id = (uint64_t)i,
+            .sg_list = &sge,
+            .num_sge = 1,
+        };
+        struct ibv_recv_wr *bad_recv_wr;
+        if (ibv_post_recv(ctx->qp, &recv_wr, &bad_recv_wr)) {
+            die("Failed to post receive request");
+        }
+	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	    buf_ptr    = ctx->buffer + buf_offset;
     }
     printf("Successfully posted receive request\n");
 }
 
-void post_send(struct rdma_context *ctx, const char *msg) {
+void post_send(struct config_t *config, struct rdma_context *ctx, const char *msg) {
     strncpy(ctx->buffer, msg, ctx->buffer_size);
-
-    struct ibv_sge sge = {
-        .addr = (uintptr_t)ctx->buffer,
-        .length = ctx->buffer_size,
-        .lkey = ctx->mr->lkey,
-    };
-
-    struct ibv_send_wr send_wr = {
-        .wr_id = 0,
-        .sg_list = &sge,
-        .num_sge = 1,
-        .opcode = IBV_WR_SEND,
-        .send_flags = IBV_SEND_SIGNALED,
-    };
-    struct ibv_send_wr *bad_send_wr;
-
     printf("Posting send request\n");
-    if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
-        die("Failed to post send request");
+    int buf_offset = 0;
+    char *buf_ptr  = ctx->buffer;
+    for (int i = 0; i < config->num_concurr_msgs; i++) {
+        struct ibv_sge sge = {
+            .addr = (uintptr_t)buf_ptr,
+            .length = config->msg_size,
+            .lkey = ctx->mr->lkey,
+        };
+        struct ibv_send_wr send_wr = {
+            .wr_id = (uint64_t)i,
+            .sg_list = &sge,
+            .num_sge = 1,
+            .opcode = IBV_WR_SEND,
+            .send_flags = IBV_SEND_SIGNALED,
+        };
+        struct ibv_send_wr *bad_send_wr;
+        if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+            perror("ibv_post_send");
+            die("Failed to post send request");
+        }
+	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	    buf_ptr    = ctx->buffer + buf_offset;
     }
     printf("Successfully posted send request\n");
 }
@@ -247,7 +260,17 @@ void cleanup_rdma_context(struct rdma_context *ctx) {
     free(ctx);
 }
 
-int main() {
+int main (int argc, char *argv[]) {
+    struct config_t *config = malloc(sizeof(struct config_t));
+    config->msg_size = 4096;
+    config->num_concurr_msgs = 1;
+
+    if (argc == 3) {
+        config->msg_size = atoi(argv[1]); 
+        config->num_concurr_msgs = atoi(argv[2]);
+    }
+    printf("msg_size = %d, num_concurr_msgs = %d\n", config->msg_size, config->num_concurr_msgs);
+    
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
     if (!dev_list) {
         die("Failed to get IB devices list");
@@ -258,8 +281,8 @@ int main() {
         }
     }
 
-    struct rdma_context *ctx_sender = init_rdma_context(dev_list[2]);
-    struct rdma_context *ctx_receiver = init_rdma_context(dev_list[8]);
+    struct rdma_context *ctx_sender   = init_rdma_context(config, dev_list[2]);
+    struct rdma_context *ctx_receiver = init_rdma_context(config, dev_list[8]);
 
     // Extract QP number and LID
     uint32_t qpn_sender = ctx_sender->qp->qp_num;
@@ -273,14 +296,13 @@ int main() {
     modify_qp_to_rts(ctx_sender->qp);
     modify_qp_to_rts(ctx_receiver->qp);
 
-
     // Perform RDMA operations here
     // Receiver should post receive first
-    post_receive(ctx_receiver);
+    post_receive(config, ctx_receiver);
 
     // Sender should post send next
     const char *msg = "Hello, RDMA!";
-    post_send(ctx_sender, msg);
+    post_send(config, ctx_sender, msg);
 
     // Poll for completion
     poll_completion(ctx_sender);
@@ -291,6 +313,7 @@ int main() {
     cleanup_rdma_context(ctx_sender);
     cleanup_rdma_context(ctx_receiver);
     ibv_free_device_list(dev_list);
+    free(config);
 
     return 0;
 }
