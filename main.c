@@ -5,6 +5,7 @@
 #include <infiniband/verbs.h>
 
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
+#define MAX_WC 20 // Maximum work completion
 
 typedef enum {
     SENDRECV,
@@ -264,11 +265,9 @@ void post_write_signaled (struct config_t *config, struct rdma_context *ctx, con
             .sg_list = &sge,
             .num_sge = 1,
             .opcode     = IBV_WR_RDMA_WRITE,
-            // .opcode     = IBV_WR_RDMA_WRITE_WITH_IMM,
             .send_flags = IBV_SEND_SIGNALED,
 	        .wr.rdma.remote_addr = raddr,
             .wr.rdma.rkey        = ctx->rkey,
-            // .imm_data = htonl(1),
         };
         struct ibv_send_wr *bad_send_wr;
         if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
@@ -282,21 +281,21 @@ void post_write_signaled (struct config_t *config, struct rdma_context *ctx, con
 }
 
 void poll_completion(struct rdma_context *ctx) {
-    struct ibv_wc wc;
+    struct ibv_wc wc[MAX_WC];
     int num_completions;
     do {
-        num_completions = ibv_poll_cq(ctx->cq, 1, &wc);
+        num_completions = ibv_poll_cq(ctx->cq, 1, wc);
     } while (num_completions == 0);
 
-    if (num_completions < 0 || wc.status != IBV_WC_SUCCESS) {
-        die("Failed to complete operation");
+    if (num_completions < 0) {
+        die("Failed to poll completion queue");
     }
 
-    // if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc.imm_data == htonl(1)) {
-    //     printf("RDMA write with immediate data completed on receiver\n");
-    // }
-
-    printf("Poll Completion");
+    for (int i = 0; i < num_completions; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            die("Work completion failed");
+        }
+    }
 }
 
 void cleanup_rdma_context(struct rdma_context *ctx) {
@@ -374,7 +373,6 @@ int main (int argc, char *argv[]) {
         post_write_signaled(config, ctx_sender, msg);
 
         // Poll for completion
-        // poll_completion(ctx_receiver);
         poll_completion(ctx_sender);
         // Display received message
         printf("Received message: %s\n", ctx_receiver->buffer);
