@@ -17,6 +17,7 @@ struct config_t {
     int msg_size;
     int num_concurr_msgs;
     int sig_interval;
+    int msg_inline; // 0: no inline, 1: inline
     rdma_op_t op;
 };
 
@@ -125,6 +126,9 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
         },
         .qp_type = IBV_QPT_RC
     };
+    if (config->msg_inline) {
+        qp_attr.cap.max_inline_data = config->msg_size;
+    }
     ctx->qp = ibv_create_qp(ctx->pd, &qp_attr);
     if (!ctx->qp) {
         die("Failed to create queue pair");
@@ -280,6 +284,9 @@ void post_write (struct config_t *config, struct rdma_context *ctx, const char *
         if (i % config->sig_interval == 0) {
             send_wr.send_flags = IBV_SEND_SIGNALED;
         }
+        if (config->msg_inline) {
+            send_wr.send_flags |= IBV_SEND_INLINE;
+        }
         struct ibv_send_wr *bad_send_wr;
         if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
             die("Failed to post write request");
@@ -324,10 +331,11 @@ int main (int argc, char *argv[]) {
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
     config->sig_interval = 1000;
+    config->msg_inline = 0;
     config->op = SENDRECV;
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:n:s:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:s:i:o:")) != -1) {
         switch (opt) {
             case 'm':
                 config->msg_size = atoi(optarg);
@@ -338,6 +346,9 @@ int main (int argc, char *argv[]) {
             case 's':
                 config->sig_interval = atoi(optarg);
                 break;
+            case 'i':
+                config->msg_inline = atoi(optarg) % 2;
+                break;
             case 'o':
                 config->op = atoi(optarg);
                 break;
@@ -346,10 +357,11 @@ int main (int argc, char *argv[]) {
                 exit(EXIT_FAILURE);
         }
     }
-    printf("msg_size = %d, num_concurr_msgs = %d, sig_interval = %d, op = %s\n",
+    printf("msg_size = %d, num_concurr_msgs = %d, sig_interval = %d, msg_inline = %s, op = %s\n",
            config->msg_size,
            config->num_concurr_msgs,
            config->sig_interval,
+           config->msg_inline ? "MSG_INLINE" : "MSG_NOINLINE",
            config->op == SENDRECV ? "SENDRECV" : "WRITE");
     
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
