@@ -16,6 +16,7 @@ typedef enum {
 struct config_t {
     int msg_size;
     int num_concurr_msgs;
+    int sig_interval;
     rdma_op_t op;
 };
 
@@ -256,9 +257,9 @@ void post_send(struct config_t *config, struct rdma_context *ctx, const char *ms
     printf("Successfully posted send request\n");
 }
 
-void post_write_signaled (struct config_t *config, struct rdma_context *ctx, const char *msg) {
+void post_write (struct config_t *config, struct rdma_context *ctx, const char *msg) {
     strncpy(ctx->buffer, msg, ctx->buffer_size);
-    printf("Posting write signaled request\n");
+    printf("Posting write request\n");
     int buf_offset = 0;
     char *buff_ptr = ctx->buffer;
     uint64_t raddr = ctx->raddr;
@@ -273,19 +274,21 @@ void post_write_signaled (struct config_t *config, struct rdma_context *ctx, con
             .sg_list = &sge,
             .num_sge = 1,
             .opcode     = IBV_WR_RDMA_WRITE,
-            .send_flags = IBV_SEND_SIGNALED,
 	        .wr.rdma.remote_addr = raddr,
             .wr.rdma.rkey        = ctx->rkey,
         };
+        if (i % config->sig_interval == 0) {
+            send_wr.send_flags = IBV_SEND_SIGNALED;
+        }
         struct ibv_send_wr *bad_send_wr;
         if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
-            die("Failed to post write signaled request");
+            die("Failed to post write request");
         }
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
 	    buff_ptr   = ctx->buffer + buf_offset;
 	    raddr      = ctx->raddr + buf_offset;
     }
-    printf("Successfully posted write signaled request\n");
+    printf("Successfully posted write request\n");
 }
 
 void poll_completion(struct rdma_context *ctx) {
@@ -320,16 +323,20 @@ int main (int argc, char *argv[]) {
     struct config_t *config = malloc(sizeof(struct config_t));
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
+    config->sig_interval = 1000;
     config->op = SENDRECV;
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:n:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:s:o:")) != -1) {
         switch (opt) {
             case 'm':
                 config->msg_size = atoi(optarg);
                 break;
             case 'n':
                 config->num_concurr_msgs = atoi(optarg);
+                break;
+            case 's':
+                config->sig_interval = atoi(optarg);
                 break;
             case 'o':
                 config->op = atoi(optarg);
@@ -339,9 +346,10 @@ int main (int argc, char *argv[]) {
                 exit(EXIT_FAILURE);
         }
     }
-    printf("msg_size = %d, num_concurr_msgs = %d, op = %s\n",
+    printf("msg_size = %d, num_concurr_msgs = %d, sig_interval = %d, op = %s\n",
            config->msg_size,
            config->num_concurr_msgs,
+           config->sig_interval,
            config->op == SENDRECV ? "SENDRECV" : "WRITE");
     
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
@@ -390,7 +398,7 @@ int main (int argc, char *argv[]) {
     } else {
         // Perform RDMA WRITE operation
         // Sender should post write
-        post_write_signaled(config, ctx_sender, msg);
+        post_write(config, ctx_sender, msg);
 
         // Poll for completion
         poll_completion(ctx_sender);
