@@ -6,8 +6,6 @@
 #include <unistd.h>
 
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
-#define MAX_WC 20 // Maximum work completion
-
 typedef enum {
     SENDRECV,
     WRITE,
@@ -16,8 +14,10 @@ typedef enum {
 struct config_t {
     int msg_size;
     int num_concurr_msgs;
+    int num_blocks;
     int sig_interval;
     int msg_inline; // 0: no inline, 1: inline
+    int msg_block_size;
     rdma_op_t op;
 };
 
@@ -29,6 +29,8 @@ struct rdma_context {
     struct ibv_qp *qp;
     struct ibv_port_attr port_attr;
     struct ibv_device_attr dev_attr;
+    struct ibv_send_wr *send_wrs;
+    struct ibv_sge *send_sges;
     char *buffer;
     size_t buffer_size;
     // for remote access
@@ -37,9 +39,12 @@ struct rdma_context {
 };
 
 void print_usage(const char *prog_name) {
-    printf("Usage: %s -m <msg_size> -n <num_concurr_msgs> -o <op>\n", prog_name);
+    printf("Usage: %s -m <msg_size> -n <num_concurr_msgs> -s <sig_interval> -i <msg_inline> -b <msg_block_size> -o <op>\n", prog_name);
     printf("  -m  Message size (in bytes)\n");
     printf("  -n  Number of concurrent messages\n");
+    printf("  -s  Signal interval\n");
+    printf("  -i  Message inline\n");
+    printf("  -b  Message block size\n");
     printf("  -o  Operation type\n");
 }
 
@@ -146,6 +151,20 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
         die("Failed to modify QP to INIT");
     } else {
         success("Successfully modified QP to INIT");
+    }
+
+    ctx->send_wrs = (struct ibv_send_wr *)calloc(config->num_concurr_msgs, sizeof(struct ibv_send_wr));
+    if (!ctx->send_wrs) {
+        die("Failed to allocate send_wrs");
+    } else {
+        success("Successfully allocated send_wrs");
+    }
+
+    ctx->send_sges = (struct ibv_sge *)calloc(config->num_concurr_msgs, sizeof(struct ibv_sge));
+    if (!ctx->send_sges) {
+        die("Failed to allocate send_sges");
+    } else {
+        success("Successfully allocated send_sges");
     }
 
     return ctx;
@@ -261,48 +280,83 @@ void post_send(struct config_t *config, struct rdma_context *ctx, const char *ms
     printf("Successfully posted send request\n");
 }
 
-void post_write (struct config_t *config, struct rdma_context *ctx, const char *msg) {
+void post_write(struct config_t *config, struct rdma_context *ctx, const char *msg) {
     strncpy(ctx->buffer, msg, ctx->buffer_size);
     printf("Posting write request\n");
+    int ind = 0;
     int buf_offset = 0;
-    char *buff_ptr = ctx->buffer;
+    char *buf_ptr = ctx->buffer;
     uint64_t raddr = ctx->raddr;
     for (int i = 0; i < config->num_concurr_msgs; i++) {
-        struct ibv_sge sge = {
-            .addr   = (uintptr_t)buff_ptr,
-            .length = config->msg_size,
-            .lkey   = ctx->mr->lkey,
-        };
-        struct ibv_send_wr send_wr = {
-            .wr_id = (uint64_t)i,
-            .sg_list = &sge,
-            .num_sge = 1,
-            .opcode     = IBV_WR_RDMA_WRITE,
-	        .wr.rdma.remote_addr = raddr,
-            .wr.rdma.rkey        = ctx->rkey,
-        };
-        if (i % config->sig_interval == 0) {
-            send_wr.send_flags = IBV_SEND_SIGNALED;
+        ctx->send_sges[i].addr = (uintptr_t)buf_ptr;
+        ctx->send_sges[i].length = config->msg_size;
+        ctx->send_sges[i].lkey = ctx->mr->lkey;
+	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+        buf_ptr = ctx->buffer + buf_offset;
+    }
+    buf_offset = 0;
+    for (int i = 0; i < (config->num_blocks - 1); i++) {
+        for (int j = 0; j < config->msg_block_size; j++) {
+	        ctx->send_wrs[ind].wr_id = ind;
+	        ctx->send_wrs[ind].next	= (j < config->msg_block_size - 1) ? &ctx->send_wrs[ind + 1] : NULL;
+	        ctx->send_wrs[ind].sg_list = &ctx->send_sges[ind];
+	        ctx->send_wrs[ind].num_sge = 1;
+	        ctx->send_wrs[ind].opcode = IBV_WR_RDMA_WRITE;
+	        ctx->send_wrs[ind].wr.rdma.remote_addr = raddr;
+	        ctx->send_wrs[ind].wr.rdma.rkey = ctx->rkey;
+            if (ind % config->sig_interval == 0) {
+                ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
+            }
+            if (config->msg_inline) {
+                ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
+            }
+	        ind += 1;
+	        buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	        raddr = ctx->raddr + buf_offset;
+        }
+    }
+    for (int j = 0; j < (config->num_concurr_msgs % config->msg_block_size); j++) {
+	    ctx->send_wrs[ind].wr_id = ind;
+	    ctx->send_wrs[ind].next	= (j < (config->num_concurr_msgs % config->msg_block_size - 1)) ? &ctx->send_wrs[ind + 1] : NULL;
+	    ctx->send_wrs[ind].sg_list = &ctx->send_sges[ind];
+	    ctx->send_wrs[ind].num_sge = 1;
+	    ctx->send_wrs[ind].opcode = IBV_WR_RDMA_WRITE;
+	    ctx->send_wrs[ind].wr.rdma.remote_addr = raddr;
+	    ctx->send_wrs[ind].wr.rdma.rkey = ctx->rkey;
+        if (ind % config->sig_interval == 0) {
+            ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
         }
         if (config->msg_inline) {
-            send_wr.send_flags |= IBV_SEND_INLINE;
+            ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
         }
+	    ind += 1;
+	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	    raddr = ctx->raddr + buf_offset;
+    }
+
+    ind = 0;
+    buf_offset = 0;
+    buf_ptr = ctx->buffer;
+    raddr = ctx->raddr;
+    for (int i = 0; i < config->num_blocks; i++) {
         struct ibv_send_wr *bad_send_wr;
-        if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+        if (ibv_post_send(ctx->qp, &ctx->send_wrs[ind], &bad_send_wr)) {
             die("Failed to post write request");
         }
-	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
-	    buff_ptr   = ctx->buffer + buf_offset;
-	    raddr      = ctx->raddr + buf_offset;
+        ind += config->msg_block_size;
+	    buf_offset = buf_offset + config->msg_size * config->msg_block_size;
+	    buf_ptr = ctx->buffer + buf_offset;
+	    raddr = ctx->raddr + buf_offset;
     }
     printf("Successfully posted write request\n");
 }
 
-void poll_completion(struct rdma_context *ctx) {
-    struct ibv_wc wc[MAX_WC];
+void poll_completion(struct config_t *config, struct rdma_context *ctx) {
     int num_completions;
+    struct ibv_wc *wcs;
+    wcs = (struct ibv_wc *)calloc(config->num_blocks, sizeof(struct ibv_wc));
     do {
-        num_completions = ibv_poll_cq(ctx->cq, 1, wc);
+        num_completions = ibv_poll_cq(ctx->cq, config->num_blocks, wcs);
     } while (num_completions == 0);
 
     if (num_completions < 0) {
@@ -310,7 +364,7 @@ void poll_completion(struct rdma_context *ctx) {
     }
 
     for (int i = 0; i < num_completions; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
+        if (wcs[i].status != IBV_WC_SUCCESS) {
             die("Work completion failed");
         }
     }
@@ -330,12 +384,14 @@ int main (int argc, char *argv[]) {
     struct config_t *config = malloc(sizeof(struct config_t));
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
+    config->num_blocks = 1;
     config->sig_interval = 1000;
     config->msg_inline = 0;
+    config->msg_block_size = config->num_concurr_msgs;
     config->op = SENDRECV;
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:n:s:i:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:s:i:b:o:")) != -1) {
         switch (opt) {
             case 'm':
                 config->msg_size = atoi(optarg);
@@ -349,6 +405,9 @@ int main (int argc, char *argv[]) {
             case 'i':
                 config->msg_inline = atoi(optarg) % 2;
                 break;
+            case 'b':
+                config->msg_block_size = atoi(optarg);
+                break;
             case 'o':
                 config->op = atoi(optarg);
                 break;
@@ -357,11 +416,15 @@ int main (int argc, char *argv[]) {
                 exit(EXIT_FAILURE);
         }
     }
-    printf("msg_size = %d, num_concurr_msgs = %d, sig_interval = %d, msg_inline = %s, op = %s\n",
+
+    config->num_blocks = (config->num_concurr_msgs + config->msg_block_size - 1) / config->msg_block_size;
+    printf("msg_size = %d, num_concurr_msgs = %d, num_blocks = %d, sig_interval = %d, msg_inline = %s, msg_block_size = %d, op = %s\n",
            config->msg_size,
            config->num_concurr_msgs,
+           config->num_blocks,
            config->sig_interval,
            config->msg_inline ? "MSG_INLINE" : "MSG_NOINLINE",
+           config->msg_block_size,
            config->op == SENDRECV ? "SENDRECV" : "WRITE");
     
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
@@ -403,8 +466,8 @@ int main (int argc, char *argv[]) {
         post_send(config, ctx_sender, msg);
 
         // Poll for completion
-        poll_completion(ctx_sender);
-        poll_completion(ctx_receiver);
+        poll_completion(config, ctx_sender);
+        poll_completion(config, ctx_receiver);
         // Display received message
         printf("Received message: %s\n", ctx_receiver->buffer);
     } else {
@@ -413,7 +476,7 @@ int main (int argc, char *argv[]) {
         post_write(config, ctx_sender, msg);
 
         // Poll for completion
-        poll_completion(ctx_sender);
+        poll_completion(config, ctx_sender);
         // Display received message
         printf("Received message: %s\n", ctx_receiver->buffer);
     }

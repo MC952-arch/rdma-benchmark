@@ -21,3 +21,6 @@ $(PROG): $(OBJS)
 
 clean:
 	$(RM) *.o *~ $(PROG)
+
+run:
+	@./rdma-benchmark -m 128 -n 32 -s 16 -i 1 -o 1 -b 4
