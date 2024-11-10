@@ -27,6 +27,7 @@ struct rdma_context {
     struct ibv_mr *mr;
     struct ibv_cq *cq;
     struct ibv_qp *qp;
+    struct ibv_srq *srq;
     struct ibv_port_attr port_attr;
     struct ibv_device_attr dev_attr;
     struct ibv_send_wr *send_wrs;
@@ -60,14 +61,14 @@ void success(const char *reason) {
 struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_device *device) {
     int ret = 0;
     struct rdma_context *ctx = malloc(sizeof(struct rdma_context));
-    if (!ctx) {
+    if(!ctx) {
         die("Failed to allocate rdma_context");
     } else {
         success("Successfully allocated rdma_context");
     }
 
     ctx->context = ibv_open_device(device);
-    if (!ctx->context) {
+    if(!ctx->context) {
         die("Failed to open device");
     } else {
         success("Successfully opened device");
@@ -77,7 +78,7 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
     }
 
     ctx->pd = ibv_alloc_pd(ctx->context);
-    if (!ctx->pd) {
+    if(!ctx->pd) {
         die("Failed to allocate protection domain");
     } else {
         success("Successfully allocated protection domain");
@@ -85,7 +86,7 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
 
     ctx->buffer_size = config->msg_size * config->num_concurr_msgs;
     ctx->buffer = malloc(ctx->buffer_size);
-    if (!ctx->buffer) {
+    if(!ctx->buffer) {
         die("Failed to allocate buffer");
     } else {
         success("Successfully allocated buffer");
@@ -93,36 +94,48 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
     printf("  Buffer Size: %lu\n", ctx->buffer_size);
 
     ctx->mr = ibv_reg_mr(ctx->pd, ctx->buffer, ctx->buffer_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!ctx->mr) {
+    if(!ctx->mr) {
         die("Failed to register memory region");
     } else {
         success("Successfully registered memory region");
     }
 
     ret = ibv_query_port(ctx->context, IB_PORT, &ctx->port_attr);
-    if (ret) {
+    if(ret) {
         die("Failed to query IB port information");
     } else {
         success("Successfully queried IB port information");
     }
 
     ret = ibv_query_device(ctx->context, &ctx->dev_attr);
-    if (ret) {
+    if(ret) {
         die("Failed to query device information");
     } else {
         success("Successfully queried device information");
     }
 
     ctx->cq = ibv_create_cq(ctx->context, ctx->dev_attr.max_cqe, NULL, NULL, 0);
-    if (!ctx->cq) {
+    if(!ctx->cq) {
         die("Failed to create completion queue");
     } else {
         success("Successfully created completion queue");
     }
 
+    struct ibv_srq_init_attr srq_init_attr = {
+        .attr.max_wr  = config->num_concurr_msgs,
+        .attr.max_sge = 1,
+    };
+    ctx->srq = ibv_create_srq (ctx->pd, &srq_init_attr);
+    if(!ctx->srq) {
+        die("Failed to create shared receive queue");
+    } else {
+        success("Successfully created shared receive queue");
+    }
+
     struct ibv_qp_init_attr qp_attr = {
         .send_cq = ctx->cq,
         .recv_cq = ctx->cq,
+        .srq = ctx->srq,
         .cap = {
             .max_send_wr = config->num_concurr_msgs,
             .max_recv_wr = config->num_concurr_msgs,
