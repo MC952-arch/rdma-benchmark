@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
 #include <unistd.h>
+#include <assert.h>
 
 #define IB_PORT 1 // Define IB_PORT with an appropriate value
 typedef enum {
@@ -14,7 +15,9 @@ typedef enum {
 struct config_t {
     int msg_size;
     int num_concurr_msgs;
-    int num_blocks;
+    int num_qps;
+    int num_concurr_msgs_per_qp;
+    int num_blocks_per_qp;
     int sig_interval;
     int msg_inline; // 0: no inline, 1: inline
     int msg_block_size;
@@ -26,7 +29,7 @@ struct rdma_context {
     struct ibv_pd *pd;
     struct ibv_mr *mr;
     struct ibv_cq *cq;
-    struct ibv_qp *qp;
+    struct ibv_qp **qps;
     struct ibv_srq *srq;
     struct ibv_port_attr port_attr;
     struct ibv_device_attr dev_attr;
@@ -40,9 +43,10 @@ struct rdma_context {
 };
 
 void print_usage(const char *prog_name) {
-    printf("Usage: %s -m <msg_size> -n <num_concurr_msgs> -s <sig_interval> -i <msg_inline> -b <msg_block_size> -o <op>\n", prog_name);
+    printf("Usage: %s -m <msg_size> -n <num_concurr_msgs> -q <num_qps> -s <sig_interval> -i <msg_inline> -b <msg_block_size> -o <op>\n", prog_name);
     printf("  -m  Message size (in bytes)\n");
     printf("  -n  Number of concurrent messages\n");
+    printf("  -q  Number of queue pairs\n");
     printf("  -s  Signal interval\n");
     printf("  -i  Message inline\n");
     printf("  -b  Message block size\n");
@@ -135,10 +139,10 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
     struct ibv_qp_init_attr qp_attr = {
         .send_cq = ctx->cq,
         .recv_cq = ctx->cq,
-        .srq = ctx->srq,
+        // .srq = ctx->srq,
         .cap = {
-            .max_send_wr = config->num_concurr_msgs,
-            .max_recv_wr = config->num_concurr_msgs,
+            .max_send_wr = config->num_concurr_msgs_per_qp,
+            .max_recv_wr = config->num_concurr_msgs_per_qp,
             .max_send_sge = 1,
             .max_recv_sge = 1
         },
@@ -147,24 +151,35 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
     if (config->msg_inline) {
         qp_attr.cap.max_inline_data = config->msg_size;
     }
-    ctx->qp = ibv_create_qp(ctx->pd, &qp_attr);
-    if (!ctx->qp) {
-        die("Failed to create queue pair");
+
+    ctx->qps = (struct ibv_qp **)calloc (config->num_qps, sizeof(struct ibv_qp *));
+    if (!ctx->qps) {
+        die("Failed to allocate qps");
     } else {
-        success("Successfully created queue pair");
+        success("Successfully allocated qps");
     }
 
-    struct ibv_qp_attr attr = {
-        .qp_state = IBV_QPS_INIT,
-        .pkey_index = 0,
-        .port_num = 1,
-        .qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
-    };
-    if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        die("Failed to modify QP to INIT");
-    } else {
-        success("Successfully modified QP to INIT");
+    for (int i = 0; i < config->num_qps; i++) {
+        ctx->qps[i] = ibv_create_qp(ctx->pd, &qp_attr);
+        if (!ctx->qps[i]) {
+            die("Failed to create queue pair");
+        } else {
+            success("Successfully created queue pair");
+        }
+
+        struct ibv_qp_attr attr = {
+            .qp_state = IBV_QPS_INIT,
+            .pkey_index = 0,
+            .port_num = 1,
+            .qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
+        };
+        if (ibv_modify_qp(ctx->qps[i], &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            die("Failed to modify QP to INIT");
+        } else {
+            success("Successfully modified QP to INIT");
+        }
     }
+
 
     ctx->send_wrs = (struct ibv_send_wr *)calloc(config->num_concurr_msgs, sizeof(struct ibv_send_wr));
     if (!ctx->send_wrs) {
@@ -256,7 +271,7 @@ void post_receive(struct config_t *config, struct rdma_context *ctx) {
             .num_sge = 1,
         };
         struct ibv_recv_wr *bad_recv_wr;
-        if (ibv_post_recv(ctx->qp, &recv_wr, &bad_recv_wr)) {
+        if (ibv_post_recv(ctx->qps[i / config->num_concurr_msgs_per_qp], &recv_wr, &bad_recv_wr)) {
             die("Failed to post receive request");
         }
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
@@ -284,7 +299,7 @@ void post_send(struct config_t *config, struct rdma_context *ctx, const char *ms
             .send_flags = IBV_SEND_SIGNALED,
         };
         struct ibv_send_wr *bad_send_wr;
-        if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+        if (ibv_post_send(ctx->qps[i / config->num_concurr_msgs_per_qp], &send_wr, &bad_send_wr)) {
             die("Failed to post send request");
         }
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
@@ -307,59 +322,62 @@ void post_write(struct config_t *config, struct rdma_context *ctx, const char *m
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
         buf_ptr = ctx->buffer + buf_offset;
     }
-    buf_offset = 0;
-    for (int i = 0; i < (config->num_blocks - 1); i++) {
-        for (int j = 0; j < config->msg_block_size; j++) {
+    for (int i = 0; i < config->num_qps; i++) {
+        for (int j = 0; j < (config->num_blocks_per_qp - 1); j++) {
+            for (int k = 0; k < config->msg_block_size; k++) {
+	            ctx->send_wrs[ind].wr_id = ind;
+	            ctx->send_wrs[ind].next	= (k < config->msg_block_size - 1) ? &ctx->send_wrs[ind + 1] : NULL;
+	            ctx->send_wrs[ind].sg_list = &ctx->send_sges[ind];
+	            ctx->send_wrs[ind].num_sge = 1;
+	            ctx->send_wrs[ind].opcode = IBV_WR_RDMA_WRITE;
+	            ctx->send_wrs[ind].wr.rdma.remote_addr = raddr;
+	            ctx->send_wrs[ind].wr.rdma.rkey = ctx->rkey;
+                  if (ind % config->sig_interval == 0) {
+                      ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
+                  }
+                  if (config->msg_inline) {
+                      ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
+                  }
+	            ind += 1;
+	            buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
+	            raddr = ctx->raddr + buf_offset;
+            }
+        }
+        for (int k = 0; k < (config->num_concurr_msgs_per_qp % config->msg_block_size); k++) {
 	        ctx->send_wrs[ind].wr_id = ind;
-	        ctx->send_wrs[ind].next	= (j < config->msg_block_size - 1) ? &ctx->send_wrs[ind + 1] : NULL;
+	        ctx->send_wrs[ind].next	= (k < (config->num_concurr_msgs_per_qp % config->msg_block_size - 1)) ? &ctx->send_wrs[ind + 1] : NULL;
 	        ctx->send_wrs[ind].sg_list = &ctx->send_sges[ind];
 	        ctx->send_wrs[ind].num_sge = 1;
 	        ctx->send_wrs[ind].opcode = IBV_WR_RDMA_WRITE;
 	        ctx->send_wrs[ind].wr.rdma.remote_addr = raddr;
 	        ctx->send_wrs[ind].wr.rdma.rkey = ctx->rkey;
-            if (ind % config->sig_interval == 0) {
-                ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
-            }
-            if (config->msg_inline) {
-                ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
-            }
+              if (ind % config->sig_interval == 0) {
+                  ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
+              }
+              if (config->msg_inline) {
+                  ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
+              }
 	        ind += 1;
 	        buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
 	        raddr = ctx->raddr + buf_offset;
         }
-    }
-    for (int j = 0; j < (config->num_concurr_msgs % config->msg_block_size); j++) {
-	    ctx->send_wrs[ind].wr_id = ind;
-	    ctx->send_wrs[ind].next	= (j < (config->num_concurr_msgs % config->msg_block_size - 1)) ? &ctx->send_wrs[ind + 1] : NULL;
-	    ctx->send_wrs[ind].sg_list = &ctx->send_sges[ind];
-	    ctx->send_wrs[ind].num_sge = 1;
-	    ctx->send_wrs[ind].opcode = IBV_WR_RDMA_WRITE;
-	    ctx->send_wrs[ind].wr.rdma.remote_addr = raddr;
-	    ctx->send_wrs[ind].wr.rdma.rkey = ctx->rkey;
-        if (ind % config->sig_interval == 0) {
-            ctx->send_wrs[ind].send_flags = IBV_SEND_SIGNALED;
-        }
-        if (config->msg_inline) {
-            ctx->send_wrs[ind].send_flags |= IBV_SEND_INLINE;
-        }
-	    ind += 1;
-	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
-	    raddr = ctx->raddr + buf_offset;
     }
 
     ind = 0;
     buf_offset = 0;
     buf_ptr = ctx->buffer;
     raddr = ctx->raddr;
-    for (int i = 0; i < config->num_blocks; i++) {
-        struct ibv_send_wr *bad_send_wr;
-        if (ibv_post_send(ctx->qp, &ctx->send_wrs[ind], &bad_send_wr)) {
-            die("Failed to post write request");
+    for (int i = 0; i < config->num_qps; i++) {
+        for (int j = 0; j < config->num_blocks_per_qp; j++) {
+            struct ibv_send_wr *bad_send_wr;
+            if (ibv_post_send(ctx->qps[i], &ctx->send_wrs[ind], &bad_send_wr)) {
+                die("Failed to post write request");
+            }
+            ind += config->msg_block_size;
+	        buf_offset = buf_offset + config->msg_size * config->msg_block_size;
+	        buf_ptr = ctx->buffer + buf_offset;
+	        raddr = ctx->raddr + buf_offset;
         }
-        ind += config->msg_block_size;
-	    buf_offset = buf_offset + config->msg_size * config->msg_block_size;
-	    buf_ptr = ctx->buffer + buf_offset;
-	    raddr = ctx->raddr + buf_offset;
     }
     printf("Successfully posted write request\n");
 }
@@ -367,9 +385,9 @@ void post_write(struct config_t *config, struct rdma_context *ctx, const char *m
 void poll_completion(struct config_t *config, struct rdma_context *ctx) {
     int num_completions;
     struct ibv_wc *wcs;
-    wcs = (struct ibv_wc *)calloc(config->num_blocks, sizeof(struct ibv_wc));
+    wcs = (struct ibv_wc *)calloc(config->num_blocks_per_qp * config->num_qps, sizeof(struct ibv_wc));
     do {
-        num_completions = ibv_poll_cq(ctx->cq, config->num_blocks, wcs);
+        num_completions = ibv_poll_cq(ctx->cq, config->num_blocks_per_qp * config->num_qps, wcs);
     } while (num_completions == 0);
 
     if (num_completions < 0) {
@@ -383,8 +401,10 @@ void poll_completion(struct config_t *config, struct rdma_context *ctx) {
     }
 }
 
-void cleanup_rdma_context(struct rdma_context *ctx) {
-    ibv_destroy_qp(ctx->qp);
+void cleanup_rdma_context(struct config_t *config, struct rdma_context *ctx) {
+    for (int i = 0; i < config->num_qps; i++) {
+        ibv_destroy_qp(ctx->qps[i]);
+    }
     ibv_destroy_cq(ctx->cq);
     ibv_dereg_mr(ctx->mr);
     ibv_dealloc_pd(ctx->pd);
@@ -397,20 +417,23 @@ int main (int argc, char *argv[]) {
     struct config_t *config = malloc(sizeof(struct config_t));
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
-    config->num_blocks = 1;
+    config->num_qps = 1;
     config->sig_interval = 1000;
     config->msg_inline = 0;
     config->msg_block_size = config->num_concurr_msgs;
     config->op = SENDRECV;
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:n:s:i:b:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:q:s:i:b:o:")) != -1) {
         switch (opt) {
             case 'm':
                 config->msg_size = atoi(optarg);
                 break;
             case 'n':
                 config->num_concurr_msgs = atoi(optarg);
+                break;
+            case 'q':
+                config->num_qps = atoi(optarg);
                 break;
             case 's':
                 config->sig_interval = atoi(optarg);
@@ -430,11 +453,15 @@ int main (int argc, char *argv[]) {
         }
     }
 
-    config->num_blocks = (config->num_concurr_msgs + config->msg_block_size - 1) / config->msg_block_size;
-    printf("msg_size = %d, num_concurr_msgs = %d, num_blocks = %d, sig_interval = %d, msg_inline = %s, msg_block_size = %d, op = %s\n",
+    assert(config->num_concurr_msgs % config->num_qps == 0 && "num_concurr_msgs must be divisible by num_qps");
+    config->num_concurr_msgs_per_qp = config->num_concurr_msgs / config->num_qps;
+    config->num_blocks_per_qp = (config->op == WRITE) ? ((config->num_concurr_msgs_per_qp + config->msg_block_size - 1) / config->msg_block_size) : 1;
+    printf("msg_size = %d, num_concurr_msgs = %d, num_qps = %d, num_concurr_msgs_per_qp = %d, num_blocks_per_qp = %d, sig_interval = %d, msg_inline = %s, msg_block_size = %d, op = %s\n",
            config->msg_size,
            config->num_concurr_msgs,
-           config->num_blocks,
+           config->num_qps,
+           config->num_concurr_msgs_per_qp,
+           config->num_blocks_per_qp,
            config->sig_interval,
            config->msg_inline ? "MSG_INLINE" : "MSG_NOINLINE",
            config->msg_block_size,
@@ -457,17 +484,18 @@ int main (int argc, char *argv[]) {
     ctx_sender->rkey = ctx_receiver->mr->rkey;
     ctx_sender->raddr = (uintptr_t)ctx_receiver->mr->addr;
 
-    // Extract QP number and LID
-    uint32_t qpn_sender = ctx_sender->qp->qp_num;
-    uint32_t qpn_receiver = ctx_receiver->qp->qp_num;
-    uint16_t lid_sender = ctx_sender->port_attr.lid;
-    uint16_t lid_receiver = ctx_receiver->port_attr.lid;
-
-    // Modify QP to RTR/RTS
-    modify_qp_to_rtr(ctx_sender->qp, qpn_receiver, lid_receiver, NULL);
-    modify_qp_to_rtr(ctx_receiver->qp, qpn_sender, lid_sender, NULL);
-    modify_qp_to_rts(ctx_sender->qp);
-    modify_qp_to_rts(ctx_receiver->qp);
+    for (int i = 0; i < config->num_qps; i++) {
+        // Extract QP number and LID
+        uint32_t qpn_sender = ctx_sender->qps[i]->qp_num;
+        uint32_t qpn_receiver = ctx_receiver->qps[i]->qp_num;
+        uint16_t lid_sender = ctx_sender->port_attr.lid;
+        uint16_t lid_receiver = ctx_receiver->port_attr.lid;
+        // Modify QP to RTR/RTS
+        modify_qp_to_rtr(ctx_sender->qps[i], qpn_receiver, lid_receiver, NULL);
+        modify_qp_to_rtr(ctx_receiver->qps[i], qpn_sender, lid_sender, NULL);
+        modify_qp_to_rts(ctx_sender->qps[i]);
+        modify_qp_to_rts(ctx_receiver->qps[i]);
+    }
 
     const char *msg = "Hello, RDMA!";
     if (config->op == SENDRECV) {
@@ -494,8 +522,8 @@ int main (int argc, char *argv[]) {
         printf("Received message: %s\n", ctx_receiver->buffer);
     }
 
-    cleanup_rdma_context(ctx_sender);
-    cleanup_rdma_context(ctx_receiver);
+    cleanup_rdma_context(config, ctx_sender);
+    cleanup_rdma_context(config, ctx_receiver);
     ibv_free_device_list(dev_list);
     free(config);
 
