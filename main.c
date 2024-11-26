@@ -19,6 +19,7 @@ struct config_t {
     int num_concurr_msgs_per_qp;
     int num_blocks_per_qp;
     int sig_interval;
+    int use_srq; // 0: false, 1: true
     int msg_inline; // 0: no inline, 1: inline
     int msg_block_size;
     rdma_op_t op;
@@ -48,6 +49,7 @@ void print_usage(const char *prog_name) {
     printf("  -n  Number of concurrent messages\n");
     printf("  -q  Number of queue pairs\n");
     printf("  -s  Signal interval\n");
+    printf("  -r  Shared receive queue\n");
     printf("  -i  Message inline\n");
     printf("  -b  Message block size\n");
     printf("  -o  Operation type\n");
@@ -125,21 +127,22 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
         success("Successfully created completion queue");
     }
 
-    struct ibv_srq_init_attr srq_init_attr = {
-        .attr.max_wr  = config->num_concurr_msgs,
-        .attr.max_sge = 1,
-    };
-    ctx->srq = ibv_create_srq (ctx->pd, &srq_init_attr);
-    if(!ctx->srq) {
-        die("Failed to create shared receive queue");
-    } else {
-        success("Successfully created shared receive queue");
+    if (config->use_srq) {
+        struct ibv_srq_init_attr srq_init_attr = {
+            .attr.max_wr  = config->num_concurr_msgs,
+            .attr.max_sge = 1,
+        };
+        ctx->srq = ibv_create_srq (ctx->pd, &srq_init_attr);
+        if(!ctx->srq) {
+            die("Failed to create shared receive queue");
+        } else {
+            success("Successfully created shared receive queue");
+        }
     }
 
     struct ibv_qp_init_attr qp_attr = {
         .send_cq = ctx->cq,
         .recv_cq = ctx->cq,
-        // .srq = ctx->srq,
         .cap = {
             .max_send_wr = config->num_concurr_msgs_per_qp,
             .max_recv_wr = config->num_concurr_msgs_per_qp,
@@ -148,6 +151,9 @@ struct rdma_context *init_rdma_context(struct config_t *config, struct ibv_devic
         },
         .qp_type = IBV_QPT_RC
     };
+    if (config->use_srq) {
+        qp_attr.srq = ctx->srq;
+    }
     if (config->msg_inline) {
         qp_attr.cap.max_inline_data = config->msg_size;
     }
@@ -271,8 +277,14 @@ void post_receive(struct config_t *config, struct rdma_context *ctx) {
             .num_sge = 1,
         };
         struct ibv_recv_wr *bad_recv_wr;
-        if (ibv_post_recv(ctx->qps[i / config->num_concurr_msgs_per_qp], &recv_wr, &bad_recv_wr)) {
-            die("Failed to post receive request");
+        if (config->use_srq) {
+            if (ibv_post_srq_recv(ctx->srq, &recv_wr, &bad_recv_wr)) {
+                die("Failed to post receive queue using SRQ");
+            }
+        } else {
+            if (ibv_post_recv(ctx->qps[i / config->num_concurr_msgs_per_qp], &recv_wr, &bad_recv_wr)) {
+                die("Failed to post receive request");
+            }
         }
 	    buf_offset = (buf_offset + config->msg_size) % ctx->buffer_size;
 	    buf_ptr    = ctx->buffer + buf_offset;
@@ -298,6 +310,10 @@ void post_send(struct config_t *config, struct rdma_context *ctx, const char *ms
             .opcode = IBV_WR_SEND,
             .send_flags = IBV_SEND_SIGNALED,
         };
+        if (config->use_srq) {
+            send_wr.opcode = IBV_WR_SEND_WITH_IMM;
+            send_wr.imm_data = htonl(i / config->num_concurr_msgs_per_qp);
+        }
         struct ibv_send_wr *bad_send_wr;
         if (ibv_post_send(ctx->qps[i / config->num_concurr_msgs_per_qp], &send_wr, &bad_send_wr)) {
             die("Failed to post send request");
@@ -398,12 +414,18 @@ void poll_completion(struct config_t *config, struct rdma_context *ctx) {
         if (wcs[i].status != IBV_WC_SUCCESS) {
             die("Work completion failed");
         }
+        if (config->use_srq) {
+            printf("Incoming message of wcs[%d] comes from QP[%d]\n", i, ntohl(wcs[i].imm_data));
+        }
     }
 }
 
 void cleanup_rdma_context(struct config_t *config, struct rdma_context *ctx) {
     for (int i = 0; i < config->num_qps; i++) {
         ibv_destroy_qp(ctx->qps[i]);
+    }
+    if (config->use_srq) {
+        ibv_destroy_srq(ctx->srq);
     }
     ibv_destroy_cq(ctx->cq);
     ibv_dereg_mr(ctx->mr);
@@ -418,13 +440,14 @@ int main (int argc, char *argv[]) {
     config->msg_size = 4096;
     config->num_concurr_msgs = 1;
     config->num_qps = 1;
+    config->use_srq = 0;
     config->sig_interval = 1000;
     config->msg_inline = 0;
     config->msg_block_size = config->num_concurr_msgs;
     config->op = SENDRECV;
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:n:q:s:i:b:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:q:s:r:i:b:o:")) != -1) {
         switch (opt) {
             case 'm':
                 config->msg_size = atoi(optarg);
@@ -437,6 +460,9 @@ int main (int argc, char *argv[]) {
                 break;
             case 's':
                 config->sig_interval = atoi(optarg);
+                break;
+            case 'r':
+                config->use_srq = atoi(optarg);
                 break;
             case 'i':
                 config->msg_inline = atoi(optarg) % 2;
@@ -456,15 +482,16 @@ int main (int argc, char *argv[]) {
     assert(config->num_concurr_msgs % config->num_qps == 0 && "num_concurr_msgs must be divisible by num_qps");
     config->num_concurr_msgs_per_qp = config->num_concurr_msgs / config->num_qps;
     config->num_blocks_per_qp = (config->op == WRITE) ? ((config->num_concurr_msgs_per_qp + config->msg_block_size - 1) / config->msg_block_size) : 1;
-    printf("msg_size = %d, num_concurr_msgs = %d, num_qps = %d, num_concurr_msgs_per_qp = %d, num_blocks_per_qp = %d, sig_interval = %d, msg_inline = %s, msg_block_size = %d, op = %s\n",
+    printf("msg_size = %d, num_concurr_msgs = %d, num_qps = %d, num_concurr_msgs_per_qp = %d, num_blocks_per_qp = %d, msg_block_size = %d, sig_interval = %d, use_srq = %s, msg_inline = %s, op = %s\n",
            config->msg_size,
            config->num_concurr_msgs,
            config->num_qps,
            config->num_concurr_msgs_per_qp,
            config->num_blocks_per_qp,
-           config->sig_interval,
-           config->msg_inline ? "MSG_INLINE" : "MSG_NOINLINE",
            config->msg_block_size,
+           config->sig_interval,
+           config->use_srq ? "TRUE" : "FALSE",
+           config->msg_inline ? "MSG_INLINE" : "MSG_NOINLINE",
            config->op == SENDRECV ? "SENDRECV" : "WRITE");
     
     struct ibv_device **dev_list = ibv_get_device_list(NULL);
